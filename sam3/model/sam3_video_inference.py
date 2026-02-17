@@ -548,16 +548,15 @@ class Sam3VideoInference(Sam3VideoBase):
 
         inference_state["cached_frame_outputs"][frame_idx] = filtered_obj_id_to_mask
 
-    def _build_tracker_output(
-        self, inference_state, frame_idx, refined_obj_id_to_mask=None
-    ):
-        assert (
-            "cached_frame_outputs" in inference_state
-            and frame_idx in inference_state["cached_frame_outputs"]
-        ), (
-            "No cached outputs found. Ensure normal propagation has run first to populate the cache."
-        )
-        cached_outputs = inference_state["cached_frame_outputs"][frame_idx]
+    def _build_tracker_output(self, inference_state, frame_idx, refined_obj_id_to_mask=None):
+        # Segmeridian patch:
+        # Allow first add/refine prompt before any propagation has populated cached_frame_outputs.
+        # In that case, start from an empty cache for this frame.
+        cfo = inference_state.setdefault("cached_frame_outputs", {})
+        cached_outputs = cfo.get(frame_idx)
+        if cached_outputs is None:
+            cached_outputs = {}
+            cfo[frame_idx] = cached_outputs
 
         obj_id_to_mask = cached_outputs.copy()
 
@@ -1576,6 +1575,14 @@ class Sam3VideoInferenceWithInstanceInteractivity(Sam3VideoInference):
             data_list = [new_mask_data.cpu() if new_mask_data is not None else None]
             self.broadcast_python_obj_cpu(data_list, src=obj_rank)
             new_mask_data = data_list[0].to(self.device)
+
+        # Segmeridian patch:
+        # Mark this frame as having outputs so propagate_in_video() can pick a start frame.
+        # (Tracker-only prompts don't set previous_stages_out, so propagation thinks there are no prompts.)
+        try:
+            inference_state["previous_stages_out"][frame_idx] = "_THIS_FRAME_HAS_OUTPUTS_"
+        except Exception:
+            pass
 
         if self.rank == 0:
             obj_id_to_mask = self._build_tracker_output(
