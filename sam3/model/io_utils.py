@@ -26,6 +26,137 @@ IMAGE_EXTS = [".jpg", ".jpeg", ".png", ".bmp", ".tiff", ".webp"]
 VIDEO_EXTS = [".mp4", ".mov", ".avi", ".mkv", ".webm"]
 
 
+def _frame_like_to_uint8_np(frame):
+    """
+    Convert a frame-like object into a uint8 numpy array.
+    Supports:
+      - PIL.Image.Image
+      - numpy.ndarray
+      - torch.Tensor
+
+    Accepted shapes:
+      - HxW
+      - HxWx1 / HxWx3 / HxWx4
+      - 1xHxW / 3xHxW / 4xHxW
+    """
+    if isinstance(frame, Image.Image):
+        arr = np.array(frame)
+        return np.ascontiguousarray(arr.astype(np.uint8, copy=False))
+
+    if isinstance(frame, torch.Tensor):
+        t = frame.detach().cpu()
+        if t.ndim == 3 and t.shape[0] in (1, 3, 4) and t.shape[-1] not in (1, 3, 4):
+            t = t.permute(1, 2, 0)
+        frame = t.numpy()
+
+    arr = np.asarray(frame)
+
+    if arr.dtype == np.bool_:
+        arr = arr.astype(np.uint8) * 255
+        return np.ascontiguousarray(arr)
+
+    if arr.dtype != np.uint8:
+        if np.issubdtype(arr.dtype, np.floating):
+            if arr.size == 0:
+                arr = arr.astype(np.uint8)
+            else:
+                amin = float(np.nanmin(arr))
+                amax = float(np.nanmax(arr))
+                if amin >= 0.0 and amax <= 1.0:
+                    arr = np.rint(arr * 255.0)
+                elif amin >= -1.0 and amax <= 1.0:
+                    arr = np.rint((arr + 1.0) * 127.5)
+                else:
+                    arr = np.clip(arr, 0.0, 255.0)
+                arr = arr.astype(np.uint8)
+        else:
+            arr = np.clip(arr, 0, 255).astype(np.uint8)
+
+    return np.ascontiguousarray(arr)
+
+
+def _frame_like_to_pil_rgb(frame):
+    """
+    Convert a frame-like object to a PIL RGB image.
+    """
+    if isinstance(frame, Image.Image):
+        return frame.convert("RGB")
+
+    arr = _frame_like_to_uint8_np(frame)
+
+    if arr.ndim == 2:
+        return Image.fromarray(arr).convert("RGB")
+
+    if arr.ndim == 3:
+        # CHW -> HWC
+        if arr.shape[0] in (1, 3, 4) and arr.shape[-1] not in (1, 3, 4):
+            arr = np.transpose(arr, (1, 2, 0))
+            arr = np.ascontiguousarray(arr)
+
+        if arr.shape[-1] == 1:
+            return Image.fromarray(arr[..., 0]).convert("RGB")
+        if arr.shape[-1] == 3:
+            return Image.fromarray(arr, mode="RGB").convert("RGB")
+        if arr.shape[-1] == 4:
+            return Image.fromarray(arr, mode="RGBA").convert("RGB")
+
+    raise TypeError(
+        f"Unsupported in-memory frame format: type={type(frame)}, "
+        f"shape={getattr(arr, 'shape', None)}"
+    )
+
+
+def load_video_frames_from_memory_list(
+    frames,
+    image_size,
+    offload_video_to_cpu,
+    img_mean=(0.5, 0.5, 0.5),
+    img_std=(0.5, 0.5, 0.5),
+):
+    """
+    Load already-available in-memory frames and convert them to the same tensor format
+    expected by the video model.
+
+    `frames` can be a list of:
+      - PIL.Image.Image
+      - numpy.ndarray
+      - torch.Tensor
+    """
+    if not isinstance(frames, list) or len(frames) == 0:
+        raise RuntimeError("frames must be a non-empty list")
+
+    first_img = _frame_like_to_pil_rgb(frames[0])
+    orig_width, orig_height = first_img.size
+
+    num_frames = len(frames)
+    img_mean_t = torch.tensor(img_mean, dtype=torch.float16)[:, None, None]
+    img_std_t = torch.tensor(img_std, dtype=torch.float16)[:, None, None]
+
+    images = torch.zeros(num_frames, 3, image_size, image_size, dtype=torch.float16)
+
+    for n, frame in enumerate(frames):
+        img_pil = _frame_like_to_pil_rgb(frame)
+        if img_pil.size != (orig_width, orig_height):
+            raise RuntimeError(
+                f"All in-memory frames must have the same size. "
+                f"Expected {(orig_width, orig_height)}, got {img_pil.size} at index {n}"
+            )
+
+        img_np = np.array(img_pil.resize((image_size, image_size)))
+        assert img_np.dtype == np.uint8, "np.uint8 is expected for in-memory frames"
+
+        img = torch.from_numpy(img_np).permute(2, 0, 1).to(dtype=torch.float16)
+        img /= 255.0
+        img -= img_mean_t
+        img /= img_std_t
+        images[n] = img
+
+    if not offload_video_to_cpu:
+        images = images.cuda()
+
+    return images, orig_height, orig_width
+
+
 def load_resource_as_video_frames(
     resource_path,
     image_size,
@@ -37,34 +168,16 @@ def load_resource_as_video_frames(
 ):
     """
     Load video frames from either a video or an image (as a single-frame video).
-    Alternatively, if input is a list of PIL images, convert its format
+    Alternatively, if input is a list of in-memory frames, convert them to model format.
     """
     if isinstance(resource_path, list):
-        img_mean = torch.tensor(img_mean, dtype=torch.float16)[:, None, None]
-        img_std = torch.tensor(img_std, dtype=torch.float16)[:, None, None]
-        assert all(isinstance(img_pil, Image.Image) for img_pil in resource_path)
-        assert len(resource_path) is not None
-        orig_height, orig_width = resource_path[0].size
-        orig_height, orig_width = (
-            orig_width,
-            orig_height,
-        )  # For some reason, this method returns these swapped
-        images = []
-        for img_pil in resource_path:
-            img_np = np.array(img_pil.convert("RGB").resize((image_size, image_size)))
-            assert img_np.dtype == np.uint8, "np.uint8 is expected for JPEG images"
-            img_np = img_np / 255.0
-            img = torch.from_numpy(img_np).permute(2, 0, 1)
-            # float16 precision should be sufficient for image tensor storage
-            img = img.to(dtype=torch.float16)
-            # normalize by mean and std
-            img -= img_mean
-            img /= img_std
-            images.append(img)
-        images = torch.stack(images)
-        if not offload_video_to_cpu:
-            images = images.cuda()
-        return images, orig_height, orig_width
+        return load_video_frames_from_memory_list(
+            frames=resource_path,
+            image_size=image_size,
+            offload_video_to_cpu=offload_video_to_cpu,
+            img_mean=img_mean,
+            img_std=img_std,
+        )
 
     is_image = (
         isinstance(resource_path, str)
