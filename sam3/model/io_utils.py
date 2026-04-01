@@ -106,6 +106,143 @@ def _frame_like_to_pil_rgb(frame):
     )
 
 
+def _detect_gray_u8_numpy_frames(frames):
+    """
+    Detect the fast-path case:
+      - frames is a non-empty list
+      - every frame is np.uint8
+      - every frame is either HxW or HxWx1
+      - all frames have the same spatial size
+
+    Returns:
+      (ok, orig_height, orig_width, layout)
+      where layout is "HW" or "HW1"
+    """
+    if not isinstance(frames, list) or len(frames) == 0:
+        return False, None, None, None
+
+    first = frames[0]
+    if not isinstance(first, np.ndarray) or first.dtype != np.uint8:
+        return False, None, None, None
+
+    if first.ndim == 2:
+        orig_height, orig_width = first.shape
+        layout = "HW"
+    elif first.ndim == 3 and first.shape[-1] == 1:
+        orig_height, orig_width = first.shape[:2]
+        layout = "HW1"
+    else:
+        return False, None, None, None
+
+    for frame in frames[1:]:
+        if not isinstance(frame, np.ndarray) or frame.dtype != np.uint8:
+            return False, None, None, None
+        if layout == "HW":
+            if frame.ndim != 2 or frame.shape != (orig_height, orig_width):
+                return False, None, None, None
+        else:
+            if frame.ndim != 3 or frame.shape != (orig_height, orig_width, 1):
+                return False, None, None, None
+
+    return True, orig_height, orig_width, layout
+
+
+def _load_video_frames_from_memory_list_gray_u8_fast(
+    frames,
+    image_size,
+    offload_video_to_cpu,
+    orig_height,
+    orig_width,
+    layout,
+    img_mean=(0.5, 0.5, 0.5),
+    img_std=(0.5, 0.5, 0.5),
+):
+    """
+    Fast path for in-memory grayscale uint8 numpy frames.
+    This avoids:
+      - per-frame PIL conversion
+      - per-frame grayscale->RGB conversion
+      - per-frame Python resize loop
+    """
+    num_frames = len(frames)
+    target_device = (
+        torch.device("cpu")
+        if offload_video_to_cpu
+        else torch.device(f"cuda:{torch.cuda.current_device()}")
+    )
+
+    images = torch.empty(
+        num_frames,
+        3,
+        image_size,
+        image_size,
+        dtype=torch.float16,
+        device=target_device,
+    )
+
+    same_channel_norm = (
+        len(img_mean) == 3
+        and len(img_std) == 3
+        and float(img_mean[0]) == float(img_mean[1]) == float(img_mean[2])
+        and float(img_std[0]) == float(img_std[1]) == float(img_std[2])
+    )
+
+    mean_scalar = float(img_mean[0])
+    std_scalar = float(img_std[0])
+
+    img_mean_t = None
+    img_std_t = None
+    if not same_channel_norm:
+        img_mean_t = torch.tensor(img_mean, dtype=torch.float32, device=target_device).view(
+            1, 3, 1, 1
+        )
+        img_std_t = torch.tensor(img_std, dtype=torch.float32, device=target_device).view(
+            1, 3, 1, 1
+        )
+
+    needs_resize = (orig_height != image_size) or (orig_width != image_size)
+
+    chunk_size = 32
+
+    for start in range(0, num_frames, chunk_size):
+        end = min(start + chunk_size, num_frames)
+
+        if layout == "HW":
+            chunk_np = np.stack(frames[start:end], axis=0)  # [B, H, W]
+        else:
+            chunk_np = np.stack([f[..., 0] for f in frames[start:end]], axis=0)  # [B, H, W]
+
+        chunk = torch.from_numpy(chunk_np).to(
+            device=target_device,
+            dtype=torch.float32,
+            non_blocking=not offload_video_to_cpu,
+        )  # [B, H, W]
+
+        chunk = chunk.unsqueeze(1)  # [B, 1, H, W]
+
+        if needs_resize:
+            chunk = F.interpolate(
+                chunk,
+                size=(image_size, image_size),
+                mode="bicubic",
+                align_corners=False,
+            )
+            chunk.clamp_(0.0, 255.0)
+
+        chunk.mul_(1.0 / 255.0)
+
+        if same_channel_norm:
+            chunk.sub_(mean_scalar).div_(std_scalar)
+            chunk = chunk.to(dtype=torch.float16)
+            images[start:end].copy_(chunk.expand(-1, 3, -1, -1))
+        else:
+            chunk = chunk.repeat(1, 3, 1, 1)
+            chunk.sub_(img_mean_t).div_(img_std_t)
+            images[start:end].copy_(chunk.to(dtype=torch.float16))
+
+    return images, orig_height, orig_width
+
+
 def load_video_frames_from_memory_list(
     frames,
     image_size,
@@ -125,6 +262,21 @@ def load_video_frames_from_memory_list(
     if not isinstance(frames, list) or len(frames) == 0:
         raise RuntimeError("frames must be a non-empty list")
 
+    # Fast path for grayscale uint8 numpy frames, which is exactly what Grow3D feeds.
+    ok_fast, orig_height, orig_width, layout = _detect_gray_u8_numpy_frames(frames)
+    if ok_fast:
+        return _load_video_frames_from_memory_list_gray_u8_fast(
+            frames=frames,
+            image_size=image_size,
+            offload_video_to_cpu=offload_video_to_cpu,
+            orig_height=orig_height,
+            orig_width=orig_width,
+            layout=layout,
+            img_mean=img_mean,
+            img_std=img_std,
+        )
+
+    # Generic fallback path for anything else.
     first_img = _frame_like_to_pil_rgb(frames[0])
     orig_width, orig_height = first_img.size
 
